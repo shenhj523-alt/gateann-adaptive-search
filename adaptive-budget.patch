@@ -1,0 +1,171 @@
+diff --git a/include/utils/percentile_stats.h b/include/utils/percentile_stats.h
+index 6e9802a..2dc7db3 100644
+--- a/include/utils/percentile_stats.h
++++ b/include/utils/percentile_stats.h
+@@ -6,6 +6,8 @@
+ 
+ namespace pipeann {
+   struct QueryStats {
++    unsigned adaptive_final_l = 0;
++    unsigned adaptive_expansions = 0;
+     double total_us = 0;        // total time to process query in micros
+     double n_4k = 0;            // # of 4kB reads
+     double n_8k = 0;            // # of 8kB reads
+diff --git a/src/search/pipe_search.cpp b/src/search/pipe_search.cpp
+index 65bd1c9..185b016 100644
+--- a/src/search/pipe_search.cpp
++++ b/src/search/pipe_search.cpp
+@@ -11,6 +11,9 @@
+ #include <chrono>
+ #include <cmath>
+ #include <cstdint>
++#include <cstdlib>
++#include <limits>
++#include <string_view>
+ #include "utils/timer.h"
+ #include "utils/tsl/robin_set.h"
+ #include "utils.h"
+@@ -78,7 +81,17 @@ namespace pipeann {
+ 
+     Timer query_timer;
+ 
+-    const unsigned effective_lsearch = l_search;
++    static const bool adaptive_enabled = [] {
++      const char *value = std::getenv("GATEANN_ADAPTIVE_L");
++      return value != nullptr && std::string_view(value) == "1";
++    }();
++    const bool adaptive = adaptive_enabled && this->filter_precheck_ && filter_data != nullptr &&
++                          this->tunneling_loaded() && relaxed_monotonicity_l == 0 &&
++                          l_search > 1 && l_search <= std::numeric_limits<unsigned>::max() / 20;
++    unsigned active_l = l_search;
++    const unsigned effective_lsearch = adaptive ? 2 * active_l : active_l;
++    const unsigned middle_l = active_l + active_l / 2;
++    unsigned expansions = 0;
+     std::vector<Neighbor> retset(mem_L + this->params.R + effective_lsearch * 10);
+     auto &visited = *(query_buf->visited);
+     unsigned cur_list_size = 0;
+@@ -254,6 +267,9 @@ namespace pipeann {
+     };
+ 
+     std::unordered_map<unsigned, DiskNode<T>> id_buf_map;
++    // Keep the reserve in the same sorted pool but only expand the active prefix.
++    auto active_size = [&]() { return std::min(cur_list_size, active_l); };
++
+     auto poll_all = [&]() -> std::pair<int, int> {
+       auto bd_io_st = std::chrono::high_resolution_clock::now();
+       // poll once.
+@@ -267,7 +283,7 @@ namespace pipeann {
+         if (this->hot_cache_ && this->hot_cache_->is_warming()) {
+           this->hot_cache_->record_and_store(io.nbr.id, (char *) disk_node.coords);
+         }
+-        io.nbr.distance <= retset[cur_list_size - 1].distance ? ++n_in : ++n_out;
++        io.nbr.distance <= retset[active_size() - 1].distance ? ++n_in : ++n_out;
+         // unlock the corresponding page.
+         this->unlock_idx(idx_lock_table, io.nbr.id);
+         on_flight_ios.pop();
+@@ -282,14 +298,14 @@ namespace pipeann {
+     auto send_best_read_req = [&](uint32_t n) -> bool {
+       // auto io_st = std::chrono::high_resolution_clock::now();
+       unsigned n_sent = 0, marker = 0;
+-      while (marker < cur_list_size && n_sent < n) {
+-        while (marker < cur_list_size /* pool size */ &&
++      while (marker < active_size() && n_sent < n) {
++        while (marker < active_size() /* active pool */ &&
+                (retset[marker].flag == false /* on flight */ ||
+                 id_buf_map.find(retset[marker].id) != id_buf_map.end() /* already read */)) {
+           retset[marker].flag = false;  // even out the id_buf_map cost to O(1)
+           ++marker;
+         }
+-        if (marker >= cur_list_size) {
++        if (marker >= active_size()) {
+           break;  // nothing to send.
+         }
+ 
+@@ -369,10 +385,10 @@ namespace pipeann {
+ 
+     auto calc_best_node = [&]() -> int {  // if converged.
+       auto bd_proc_st = std::chrono::high_resolution_clock::now();
+-      unsigned marker = 0, nk = cur_list_size, first_unvisited_eager = cur_list_size;
++      unsigned marker = 0, nk = cur_list_size, first_unvisited_eager = active_size();
+       /* Process one entry from id_buf_map (disk reads or lazy hot cache hits) */
+       bool processed_id_buf = false;
+-      for (marker = 0; marker < cur_list_size; ++marker) {
++      for (marker = 0; marker < active_size(); ++marker) {
+         if (!retset[marker].visited && id_buf_map.find(retset[marker].id) != id_buf_map.end()) {
+           retset[marker].flag = false;  // even out the id_buf_map cost to O(1)
+           retset[marker].visited = true;
+@@ -395,7 +411,7 @@ namespace pipeann {
+ 
+ 
+ /* guess the first unvisited vector (eager) */
+-      for (unsigned i = 0; i < cur_list_size; ++i) {
++      for (unsigned i = 0; i < active_size(); ++i) {
+         if (!retset[i].visited && retset[i].flag /* not on-fly */
+             && id_buf_map.find(retset[i].id) == id_buf_map.end() /* not already read */) {
+           first_unvisited_eager = i;
+@@ -411,7 +427,7 @@ namespace pipeann {
+ 
+     auto get_first_unvisited = [&]() -> int {
+       int ret = -1;
+-      for (unsigned i = 0; i < cur_list_size; ++i) {
++      for (unsigned i = 0; i < active_size(); ++i) {
+         if (!retset[i].visited) {
+           ret = i;
+           break;
+@@ -465,7 +481,19 @@ namespace pipeann {
+ #endif
+ 
+     int cur_n_in = 0, cur_tot = 0;
+-    while (get_first_unvisited() != -1) {
++    while (true) {
++      if (get_first_unvisited() == -1) {
++        // A low yield of exact matches is a budget trigger, not a recall estimate.
++        if (!adaptive || active_l == effective_lsearch ||
++            full_retset.size() >= 2 * k_search ||
++            std::none_of(retset.begin() + active_size(), retset.begin() + cur_list_size,
++                         [](const Neighbor &node) { return !node.visited; })) {
++          break;
++        }
++        active_l = expansions == 0 ? middle_l : effective_lsearch;
++        ++expansions;
++        continue;
++      }
+       // poll to heap (best-effort) -> calc best from heap (skip if heap is empty) -> send IO (if can send) -> ...
+       // auto io1_st = std::chrono::high_resolution_clock::now();
+       auto [n_in, n_out] = poll_all();
+@@ -530,6 +558,17 @@ namespace pipeann {
+       }
+     }
+ 
++    if (adaptive) {
++      // A read submitted in the active prefix can move into the reserve as the pool changes.
++      // Finish it before returning the query's I/O buffers.
++      while (!on_flight_ios.empty()) {
++        poll_all();
++      }
++      if (stats != nullptr) {
++        stats->adaptive_final_l = active_l;
++        stats->adaptive_expansions = expansions;
++      }
++    }
+     auto cpu2_ed = std::chrono::high_resolution_clock::now();
+     if (stats != nullptr) {
+       stats->cpu_us2 = std::chrono::duration_cast<std::chrono::microseconds>(cpu2_ed - cpu2_st).count();
+diff --git a/tests/search_disk_index_yfcc.cpp b/tests/search_disk_index_yfcc.cpp
+index e193967..c5c724e 100644
+--- a/tests/search_disk_index_yfcc.cpp
++++ b/tests/search_disk_index_yfcc.cpp
+@@ -288,6 +288,13 @@ int run(int argc, char **argv) {
+               << std::setw(12) << std::fixed << std::setprecision(0) << mean_bd_tunnel
+               << std::setw(12) << std::fixed << std::setprecision(0) << mean_bd_process
+               << std::endl;
++    const auto expanded = std::count_if(stats.begin(), stats.end(),
++        [](const pipeann::QueryStats &s) { return s.adaptive_expansions > 0; });
++    const auto at_cap = std::count_if(stats.begin(), stats.end(),
++        [](const pipeann::QueryStats &s) { return s.adaptive_expansions == 2; });
++    std::cout << "GateANN metrics L=" << L << " queries=" << query_num
++              << " mean_latency_us=" << std::setprecision(3) << elapsed_s * 1e6 / query_num
++              << " expanded=" << expanded << " at_cap=" << at_cap << std::endl;
+   }
+ 
+   delete[] query;
